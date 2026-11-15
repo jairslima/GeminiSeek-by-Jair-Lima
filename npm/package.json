@@ -1,0 +1,27 @@
+{
+  "name": "geminiseek-by-jair-lima",
+  "version": "1.1.0",
+  "description": "GeminiSeek by Jair Lima: Google Gemini CLI harness pre-configured and optimized for the DeepSeek API (1M context window).",
+  "license": "MIT",
+  "author": "Jair Lima",
+  "bin": {
+    "geminiseek": "bin/geminiseek.mjs"
+  },
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/jairslima/GeminiSeek-by-Jair-Lima.git"
+  },
+  "keywords": [
+    "gemini",
+    "gemini-cli",
+    "deepseek",
+    "geminiseek",
+    "ai-agent",
+    "cli",
+    "h2h"
+  ]
+}
