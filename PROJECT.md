@@ -91,5 +91,5 @@ geminiseek --pro exec --skip-git-repo-check -s workspace-write -C "C:\caminho\pr
 ---
 
 ## 6. Estado Atual e Próximos Passos
-- **Estado Atual (2026-11-12, v1.1.0):** Concluído, testado e homologado em produção. Inclui Gateway In-Memory Gemini->DeepSeek (`internal/bridge`), sincronização upstream automática (`geminiseek update`), consulta de saldo em tempo real (`geminiseek balance` / `geminiseek saldo`), Modo Recap automático com saldo (`geminiseek recap`, hook `AfterAgent` e `GEMINI.md`), auditoria automática H2H (`~/.geminiseek/h2h-usage.jsonl`) e dupla compatibilidade de flags CLI (`-p -y` e `exec -C -s`).
+- **Estado Atual (2026-11-15, v1.1.0):** Concluído, testado e homologado em produção. Inclui Gateway In-Memory Gemini->DeepSeek (`internal/bridge`), sincronização upstream automática (`geminiseek update`), consulta de saldo em tempo real (`geminiseek balance` / `geminiseek saldo`), guarda nativa de saldo (`geminiseek guard 0.50` e `--min-balance`), isolamento rápido de MCP no modo headless (`exec`/`-p`, com `--with-mcp` opcional), modo de saída limpa (`--clean`), Modo Recap automático com saldo (`geminiseek recap`, hook `AfterAgent` e `GEMINI.md`), estatísticas de tokens (`geminiseek stats`), auditoria automática H2H (`~/.geminiseek/h2h-usage.jsonl`) e dupla compatibilidade de flags CLI (`-p -y` e `exec -C -s`).
 - **Problemas Conhecidos:** Nenhum.

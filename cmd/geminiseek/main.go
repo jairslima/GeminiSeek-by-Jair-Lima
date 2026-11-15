@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"strconv"
 
 	"github.com/jairslima/GeminiSeek-by-Jair-Lima/internal/catalog"
 	"github.com/jairslima/GeminiSeek-by-Jair-Lima/internal/config"
@@ -45,6 +46,15 @@ func main() {
 				}
 			}
 			os.Exit(sync.RunBalance(shortOnly, jsonOut))
+
+		case "guard":
+			minUSD := 0.50
+			if len(args) > 1 {
+				if v, err := strconv.ParseFloat(args[1], 64); err == nil {
+					minUSD = v
+				}
+			}
+			os.Exit(sync.RunGuard(minUSD))
 
 		case "recap":
 			os.Exit(sync.RunRecap())
@@ -132,6 +142,8 @@ Atalhos exclusivos do GeminiSeek:
   -m <flash|pro|chat|r1>     Seleciona o modelo DeepSeek por alias curto ou slug oficial
   geminiseek -p "tarefa" -y  Executa tarefa em modo headless autônomo (estilo Gemini CLI)
   geminiseek exec -C <dir>   Executa tarefa em modo headless (compatível com sintaxe CodexSeek)
+  --clean / --with-mcp       Saída limpa sem banners/recap (--clean) ou carga de MCPs no modo exec (--with-mcp)
+  geminiseek guard [min_usd] Guarda nativa de saldo DeepSeek (ex: geminiseek guard 0.50 -> JSON GO/SALDO_BAIXO)
   geminiseek balance|saldo   Exibe o saldo atual da conta DeepSeek API em USD
   geminiseek recap           Exibe o recap consolidado da sessão + histórico H2H + saldo DeepSeek
   geminiseek stats           Exibe estatísticas acumuladas de uso, tempo e consumo de tokens

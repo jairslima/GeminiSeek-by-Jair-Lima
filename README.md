@@ -65,12 +65,13 @@ go build -ldflags="-s -w" -o "$HOME/bin/geminiseek.exe" ./cmd/geminiseek
 
 ## Como Usar
 
-### Diagnóstico de Saúde (`doctor`), Saldo (`balance` / `saldo`) e Estatísticas (`stats`)
+### Diagnóstico de Saúde (`doctor`), Guarda de Saldo (`guard`), Saldo (`balance`) e Estatísticas (`stats`)
 Verifica o runtime Node.js, o bundle JS direto do Gemini CLI (sem `.cmd`), a bridge local em memória, a chave mascarada, a conectividade ao vivo e o **saldo atual em USD da conta DeepSeek**:
 ```bash
 geminiseek doctor
-geminiseek balance   # ou: geminiseek saldo | geminiseek balance --short
-geminiseek stats     # ou: geminiseek stats --json
+geminiseek guard 0.50 # Guarda nativa de saldo (JSON: {"decisao":"GO","saldo":...})
+geminiseek balance    # ou: geminiseek saldo | geminiseek balance --short
+geminiseek stats      # ou: geminiseek stats --json
 ```
 
 ### Modo Recap Automático e Recap da Sessão (`recap`)
@@ -97,9 +98,12 @@ geminiseek -p "Refatore o módulo X e rode os testes" -y
 # Sintaxe compatível com CodexSeek / H2H (DeepSeek V4 Pro)
 geminiseek --pro exec --skip-git-repo-check -s workspace-write -C "C:/caminho/do/projeto" "Analise a arquitetura e corrija o bug"
 
-# Prompt via stdin (-) ou arquivo (--prompt-file) e análise de imagem (-i)
+# Prompt via stdin (-) ou arquivo (--prompt-file) e análise de imagem (-i em qualquer posição)
 cat prompt.txt | geminiseek exec -C "C:/Temp" -
-geminiseek exec -C "C:/Temp" "Descreva a imagem" -i "C:/Temp/captura.png"
+geminiseek exec -C "C:/Temp" -i "C:/Temp/captura.png" "Descreva a imagem"
+
+# Saída limpa (--clean) sem banners YOLO nem linha recap:, ideal para captura direta em scripts H2H
+geminiseek exec --clean --min-balance 0.50 -C "C:/Temp" "Retorne apenas a versão do Go instalada"
 ```
 
 ### Atualização Automática com o Gemini CLI Upstream (`update` / `sync-upstream`)

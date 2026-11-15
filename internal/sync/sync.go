@@ -17,6 +17,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -600,6 +601,74 @@ func RunBalance(shortOnly, jsonOut bool) int {
 		fmt.Printf("  Saldo Bônus/Granted : %s %s\n", info.GrantedBalance, info.Currency)
 	}
 	return 0
+}
+
+// ParseBalanceUSD extracts the numeric USD (or primary currency) balance from a BalanceResponse.
+func ParseBalanceUSD(bal *BalanceResponse) (float64, string) {
+	if bal == nil || len(bal.BalanceInfos) == 0 {
+		return 0, "?"
+	}
+	chosen := bal.BalanceInfos[0]
+	for _, info := range bal.BalanceInfos {
+		if strings.EqualFold(info.Currency, "USD") {
+			chosen = info
+			break
+		}
+	}
+	val, _ := strconv.ParseFloat(strings.TrimSpace(chosen.TotalBalance), 64)
+	return val, chosen.Currency
+}
+
+// RunGuard implements the native equivalent of `deepseek_guard.py <min_usd>`:
+// it checks the live DeepSeek balance against minUSD (default 0.50), prints the
+// structured JSON decision (`GO`, `SALDO_BAIXO`, `INDISPONIVEL`, `ERRO`), and
+// returns exit code 0 when GO or 2 when blocked.
+func RunGuard(minUSD float64) int {
+	if minUSD <= 0 {
+		minUSD = 0.50
+	}
+	apiKey, _, err := config.ResolveAPIKey()
+	if err != nil {
+		out, _ := json.Marshal(map[string]any{
+			"decisao": "ERRO",
+			"motivo":  err.Error(),
+		})
+		fmt.Println(string(out))
+		return 2
+	}
+	bal, err := FetchDeepSeekBalance(apiKey)
+	if err != nil || bal == nil {
+		motivo := "falha na consulta de saldo"
+		if err != nil {
+			motivo = err.Error()
+		}
+		out, _ := json.Marshal(map[string]any{
+			"decisao": "ERRO",
+			"motivo":  motivo,
+		})
+		fmt.Println(string(out))
+		return 2
+	}
+	saldo, moeda := ParseBalanceUSD(bal)
+	decisao := "GO"
+	exitCode := 0
+	if !bal.IsAvailable {
+		decisao = "INDISPONIVEL"
+		exitCode = 2
+	} else if saldo < minUSD {
+		decisao = "SALDO_BAIXO"
+		exitCode = 2
+	}
+	payload := map[string]any{
+		"decisao":      decisao,
+		"saldo":        saldo,
+		"moeda":        moeda,
+		"minimo":       minUSD,
+		"is_available": bal.IsAvailable,
+	}
+	b, _ := json.Marshal(payload)
+	fmt.Println(string(b))
+	return exitCode
 }
 
 // RunDoctor performs a complete diagnostic of the GeminiSeek installation,

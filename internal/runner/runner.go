@@ -9,6 +9,7 @@
 package runner
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -16,6 +17,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -44,12 +46,16 @@ type UsageLogRecord struct {
 
 // TransformResult holds the transformed CLI arguments and metadata for Gemini CLI invocation.
 type TransformResult struct {
-	Args          []string
-	SelectedModel string
-	Mode          string
-	WorkDir       string
-	PromptBrief   string
-	ReadStdin     bool
+	Args              []string
+	SelectedModel     string
+	Mode              string
+	WorkDir           string
+	PromptBrief       string
+	ReadStdin         bool
+	ExtraAttachments  []string
+	IncludeUserMCP    bool
+	CleanOutput       bool
+	MinBalanceUSD     float64
 }
 
 // knownSubcommands lists Gemini CLI subcommands where `-m` should not be prepended.
@@ -81,6 +87,10 @@ func TransformArgs(rawArgs []string) TransformResult {
 	hasPromptFlag := false
 	readStdin := false
 	isSubcommand := false
+	explicitWithMCP := os.Getenv("GEMINISEEK_KEEP_USER_MCP") == "1"
+	explicitNoMCP := os.Getenv("GEMINISEEK_IGNORE_USER_MCP") == "1"
+	cleanOutput := false
+	minBalanceUSD := 0.0
 	var extraAttachments []string
 
 	for i := 0; i < len(rawArgs); i++ {
@@ -112,12 +122,32 @@ func TransformArgs(rawArgs []string) TransformResult {
 			selectedModel = config.ResolveModelAlias(val)
 			continue
 
-		// CodexSeek H2H compatibility flags (`exec`, `--skip-git-repo-check`, `-C`, `-s`, `-a`, `-i`)
+		// CodexSeek H2H compatibility flags (`exec`, `--skip-git-repo-check`, `-C`, `-s`, `-a`, `-i`, `--with-mcp`, `--clean`)
 		case (arg == "exec" || arg == "e") && !isExecCompat && !isSubcommand:
 			isExecCompat = true
 			mode = "exec"
 			continue
-		case arg == "--skip-git-repo-check" || arg == "--ignore-user-config":
+		case arg == "--skip-git-repo-check" || arg == "--ignore-user-config" || arg == "--no-mcp":
+			if arg == "--ignore-user-config" || arg == "--no-mcp" {
+				explicitNoMCP = true
+			}
+			continue
+		case arg == "--with-mcp" || arg == "--keep-user-config":
+			explicitWithMCP = true
+			continue
+		case arg == "--clean" || arg == "--clean-output" || arg == "--quiet-meta":
+			cleanOutput = true
+			continue
+		case arg == "--min-balance" && i+1 < len(rawArgs):
+			if v, err := strconv.ParseFloat(rawArgs[i+1], 64); err == nil {
+				minBalanceUSD = v
+			}
+			i++
+			continue
+		case strings.HasPrefix(arg, "--min-balance="):
+			if v, err := strconv.ParseFloat(strings.TrimPrefix(arg, "--min-balance="), 64); err == nil {
+				minBalanceUSD = v
+			}
 			continue
 		case (arg == "-C" || arg == "--cd") && i+1 < len(rawArgs):
 			workDir = rawArgs[i+1]
@@ -173,10 +203,11 @@ func TransformArgs(rawArgs []string) TransformResult {
 
 	if isSubcommand {
 		return TransformResult{
-			Args:          cleaned,
-			SelectedModel: selectedModel,
-			Mode:          cleaned[0],
-			WorkDir:       workDir,
+			Args:           cleaned,
+			SelectedModel:  selectedModel,
+			Mode:           cleaned[0],
+			WorkDir:        workDir,
+			IncludeUserMCP: true,
 		}
 	}
 
@@ -201,7 +232,8 @@ func TransformArgs(rawArgs []string) TransformResult {
 	}
 
 	// Append any `-i <image>` attachments to the `-p` prompt so Gemini CLI loads them cleanly
-	if len(extraAttachments) > 0 {
+	// (when reading from stdin `-`, Run() appends ExtraAttachments after reading stdin)
+	if len(extraAttachments) > 0 && !readStdin {
 		attachSuffix := ""
 		for _, att := range extraAttachments {
 			attachSuffix += fmt.Sprintf(" @%s", att)
@@ -213,6 +245,16 @@ func TransformArgs(rawArgs []string) TransformResult {
 				break
 			}
 		}
+	}
+
+	// Just like CodexSeek's `--ignore-user-config` in `exec` mode, skip user MCP servers by default
+	// in headless/exec calls for ~10x faster startup, unless `--with-mcp` is passed.
+	includeUserMCP := true
+	if mode == "exec" || mode == "headless" {
+		includeUserMCP = explicitWithMCP
+	}
+	if explicitNoMCP {
+		includeUserMCP = false
 	}
 
 	finalArgs := make([]string, 0, len(cleaned)+6)
@@ -233,12 +275,16 @@ func TransformArgs(rawArgs []string) TransformResult {
 	}
 
 	return TransformResult{
-		Args:          finalArgs,
-		SelectedModel: selectedModel,
-		Mode:          mode,
-		WorkDir:       workDir,
-		PromptBrief:   promptBrief,
-		ReadStdin:     readStdin,
+		Args:             finalArgs,
+		SelectedModel:    selectedModel,
+		Mode:             mode,
+		WorkDir:          workDir,
+		PromptBrief:      promptBrief,
+		ReadStdin:        readStdin,
+		ExtraAttachments: extraAttachments,
+		IncludeUserMCP:   includeUserMCP,
+		CleanOutput:      cleanOutput,
+		MinBalanceUSD:    minBalanceUSD,
 	}
 }
 
@@ -264,23 +310,41 @@ func Run(rawArgs []string) (int, error) {
 		return 1, err
 	}
 
+	tr := TransformArgs(rawArgs)
+
 	// Pre-fetch and cache DeepSeek balance before preparing isolated profile
 	cachedBalanceSummary := ""
+	var liveBal *sync.BalanceResponse
 	if bal, balErr := sync.FetchDeepSeekBalance(apiKey); balErr == nil {
+		liveBal = bal
 		cachedBalanceSummary = sync.FormatBalanceSummary(bal)
+	}
+
+	if tr.MinBalanceUSD > 0 && liveBal != nil {
+		saldo, moeda := sync.ParseBalanceUSD(liveBal)
+		if !liveBal.IsAvailable || saldo < tr.MinBalanceUSD {
+			return 2, fmt.Errorf("guarda de saldo DeepSeek bloqueou a execução: saldo atual %.2f %s é inferior ao mínimo exigido de %.2f USD", saldo, moeda, tr.MinBalanceUSD)
+		}
 	}
 
 	upstreamVer := config.GetUpstreamVersion(bundlePath)
 	selfExe, _ := os.Executable()
-	_, geminiHome, err := catalog.EnsureCatalog(upstreamVer, stateDir, selfExe, cachedBalanceSummary, false)
+	_, geminiHome, err := catalog.EnsureCatalog(upstreamVer, stateDir, selfExe, cachedBalanceSummary, false, catalog.ProfileOptions{
+		IncludeUserMCP: tr.IncludeUserMCP,
+		SuppressRecap:  tr.CleanOutput,
+	})
 	if err != nil {
 		return 1, fmt.Errorf("erro ao preparar perfil isolado GeminiSeek: %w", err)
 	}
 
-	tr := TransformArgs(rawArgs)
 	if tr.ReadStdin {
 		if stdinBytes, err := io.ReadAll(os.Stdin); err == nil {
 			stdinText := strings.TrimSpace(strings.TrimPrefix(string(stdinBytes), "\uFEFF"))
+			if len(tr.ExtraAttachments) > 0 {
+				for _, att := range tr.ExtraAttachments {
+					stdinText += fmt.Sprintf(" @%s", att)
+				}
+			}
 			for idx := 0; idx < len(tr.Args)-1; idx++ {
 				if (tr.Args[idx] == "-p" || tr.Args[idx] == "--prompt") && tr.Args[idx+1] == "-" {
 					tr.Args[idx+1] = stdinText
@@ -311,8 +375,14 @@ func Run(rawArgs []string) (int, error) {
 
 	cmd := exec.Command(nodeBin, nodeArgs...)
 	cmd.Stdin = os.Stdin
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
+	var cleanStdoutBuf, cleanStderrBuf bytes.Buffer
+	if tr.CleanOutput {
+		cmd.Stdout = &cleanStdoutBuf
+		cmd.Stderr = &cleanStderrBuf
+	} else {
+		cmd.Stdout = os.Stdout
+		cmd.Stderr = os.Stderr
+	}
 
 	effectiveWorkDir, _ := os.Getwd()
 	if tr.WorkDir != "" {
@@ -392,6 +462,17 @@ func Run(rawArgs []string) (int, error) {
 	err = cmd.Run()
 	duration := time.Since(startTime).Seconds()
 
+	if tr.CleanOutput {
+		outStr := FilterCleanOutput(cleanStdoutBuf.String())
+		if outStr != "" {
+			fmt.Println(outStr)
+		}
+		errStr := FilterCleanStderr(cleanStderrBuf.String())
+		if errStr != "" && err != nil {
+			fmt.Fprintln(os.Stderr, errStr)
+		}
+	}
+
 	exitCode := 0
 	if err != nil {
 		if exitErr, ok := err.(*exec.ExitError); ok {
@@ -434,4 +515,35 @@ func recordUsageLog(stateDir, mode, model, workDir, brief string, durationSec fl
 	}
 	defer f.Close()
 	_, _ = f.Write(append(b, '\n'))
+}
+
+// FilterCleanOutput removes trailing `recap:` lines and Gemini CLI status banners from stdout when `--clean` is active.
+func FilterCleanOutput(raw string) string {
+	lines := strings.Split(strings.ReplaceAll(raw, "\r\n", "\n"), "\n")
+	filtered := make([]string, 0, len(lines))
+	for _, l := range lines {
+		trimmed := strings.TrimSpace(l)
+		if strings.HasPrefix(strings.ToLower(trimmed), "recap:") && strings.Contains(trimmed, "Saldo DeepSeek") {
+			continue
+		}
+		if trimmed == "YOLO mode is enabled. All tool calls will be automatically approved." {
+			continue
+		}
+		filtered = append(filtered, l)
+	}
+	return strings.TrimSpace(strings.Join(filtered, "\n"))
+}
+
+// FilterCleanStderr strips noisy `YOLO mode is enabled` lines from stderr.
+func FilterCleanStderr(raw string) string {
+	lines := strings.Split(strings.ReplaceAll(raw, "\r\n", "\n"), "\n")
+	filtered := make([]string, 0, len(lines))
+	for _, l := range lines {
+		trimmed := strings.TrimSpace(l)
+		if trimmed == "" || trimmed == "YOLO mode is enabled. All tool calls will be automatically approved." {
+			continue
+		}
+		filtered = append(filtered, l)
+	}
+	return strings.TrimSpace(strings.Join(filtered, "\n"))
 }

@@ -72,10 +72,27 @@ func DefaultModels() []DeepSeekModelSpec {
 	}
 }
 
+// ProfileOptions controls optional features in the isolated Gemini CLI profile.
+type ProfileOptions struct {
+	IncludeUserMCP bool
+	SuppressRecap  bool
+}
+
 // EnsureCatalog creates or updates the DeepSeek catalog metadata and the isolated
 // Gemini CLI profile under `~/.geminiseek/gemini_home/.gemini/settings.json`.
 // It returns the path to the generated catalog JSON and the `GEMINI_CLI_HOME` directory.
-func EnsureCatalog(upstreamVersion, stateDir, selfExe, currentBalance string, forceRebuild bool) (string, string, error) {
+func EnsureCatalog(upstreamVersion, stateDir, selfExe, currentBalance string, forceRebuild bool, opts ...ProfileOptions) (string, string, error) {
+	opt := ProfileOptions{
+		IncludeUserMCP: os.Getenv("GEMINISEEK_IGNORE_USER_MCP") != "1",
+		SuppressRecap:  false,
+	}
+	if len(opts) > 0 {
+		opt = opts[0]
+		if os.Getenv("GEMINISEEK_IGNORE_USER_MCP") == "1" {
+			opt.IncludeUserMCP = false
+		}
+	}
+
 	if err := os.MkdirAll(stateDir, 0755); err != nil {
 		return "", "", fmt.Errorf("failed to create state dir: %w", err)
 	}
@@ -118,7 +135,7 @@ func EnsureCatalog(upstreamVersion, stateDir, selfExe, currentBalance string, fo
 	_ = os.WriteFile(filepath.Join(stateDir, "deepseek_catalog.json"), catBytes, 0644)
 
 	// Build isolated ~/.geminiseek/gemini_home/.gemini/settings.json
-	if err := writeIsolatedGeminiSettings(dotGeminiDir, selfExe); err != nil {
+	if err := writeIsolatedGeminiSettings(dotGeminiDir, selfExe, opt.IncludeUserMCP); err != nil {
 		return "", "", err
 	}
 
@@ -128,12 +145,12 @@ func EnsureCatalog(upstreamVersion, stateDir, selfExe, currentBalance string, fo
 	}
 
 	// Write global GEMINI.md into isolated home with live DeepSeek balance
-	syncGlobalGeminiMD(dotGeminiDir, currentBalance)
+	syncGlobalGeminiMD(dotGeminiDir, currentBalance, opt.SuppressRecap)
 
 	return catalogPath, geminiHome, nil
 }
 
-func writeIsolatedGeminiSettings(dotGeminiDir, selfExe string) error {
+func writeIsolatedGeminiSettings(dotGeminiDir, selfExe string, includeUserMCP bool) error {
 	modelDefs := make(map[string]any)
 	modelAliases := make(map[string]any)
 	modelResolutions := make(map[string]any)
@@ -269,8 +286,8 @@ func writeIsolatedGeminiSettings(dotGeminiDir, selfExe string) error {
 		},
 	}
 
-	// Merge user's MCP servers from ~/.gemini/settings.json if present and not disabled
-	if os.Getenv("GEMINISEEK_IGNORE_USER_MCP") != "1" {
+	// Merge user's MCP servers from ~/.gemini/settings.json when enabled (interactive TUI or --with-mcp)
+	if includeUserMCP {
 		if home, err := os.UserHomeDir(); err == nil {
 			userSettingsPath := filepath.Join(home, ".gemini", "settings.json")
 			if raw, err := os.ReadFile(userSettingsPath); err == nil {
@@ -323,10 +340,17 @@ func writeTrustedFolders(dotGeminiDir string) error {
 	return os.WriteFile(filepath.Join(dotGeminiDir, "trustedFolders.json"), b, 0644)
 }
 
-func syncGlobalGeminiMD(dotGeminiDir, currentBalance string) {
+func syncGlobalGeminiMD(dotGeminiDir, currentBalance string, suppressRecap bool) {
 	if strings.TrimSpace(currentBalance) == "" {
 		currentBalance = "ativo"
 	}
+	recapRule := fmt.Sprintf(`4. **Recap Automático + Saldo DeepSeek:** Sempre que concluir uma tarefa operacional ou quando o usuário solicitar um recap/resumo, inclua como **última linha** da sua resposta o resumo consolidado acompanhado do saldo atual da conta DeepSeek (%s):
+`+"`recap: <resumo objetivo do que foi feito>. Próximo passo: <ação pendente ou concluído>. [Saldo DeepSeek: %s]`"+`
+`, currentBalance, currentBalance)
+	if suppressRecap {
+		recapRule = "4. **Saída Limpa (`--clean`):** Entregue apenas o resultado direto da tarefa solicitada, sem anexar linha `recap:` ao final da resposta.\n"
+	}
+
 	content := fmt.Sprintf(`# Diretrizes Globais: GeminiSeek by Jair Lima (Google Gemini CLI + API DeepSeek)
 
 Você é o **GeminiSeek by Jair Lima**, um agente autônomo de engenharia de software executado sobre o harness open source **Google Gemini CLI** e alimentado nativamente pelos modelos de 1M de contexto da **API da DeepSeek** (`+"`deepseek-flash`"+` / DeepSeek V4.1 Flash e `+"`deepseek-v4-pro`"+` / DeepSeek V4 Pro).
@@ -335,9 +359,7 @@ Você é o **GeminiSeek by Jair Lima**, um agente autônomo de engenharia de sof
 1. **Idioma e Escrita:** Responda sempre em **português do Brasil**, com acentuação correta e **sem usar travessão** (— ou -) como pontuação. Use vírgula, ponto ou dois-pontos no lugar.
 2. **Identidade:** Quando perguntado sobre qual modelo ou agente você é, identifique-se com precisão como **GeminiSeek by Jair Lima** alimentado pelo modelo **DeepSeek** ativo na sessão.
 3. **Voz do Autor em Manuscritos:** Ao redigir ou revisar textos de livros, nunca escreva "Jair Lima" nem "o autor" no corpo do texto.
-4. **Recap Automático + Saldo DeepSeek:** Sempre que concluir uma tarefa operacional ou quando o usuário solicitar um recap/resumo, inclua como **última linha** da sua resposta o resumo consolidado acompanhado do saldo atual da conta DeepSeek (%s):
-`+"`recap: <resumo objetivo do que foi feito>. Próximo passo: <ação pendente ou concluído>. [Saldo DeepSeek: %s]`"+`
-`, currentBalance, currentBalance)
+%s`, recapRule)
 
 	targetPath := filepath.Join(dotGeminiDir, "GEMINI.md")
 	_ = os.WriteFile(targetPath, []byte(content), 0644)

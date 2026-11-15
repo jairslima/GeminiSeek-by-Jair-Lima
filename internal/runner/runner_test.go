@@ -67,4 +67,38 @@ func TestTransformArgsStdinAndImageAttachment(t *testing.T) {
 	if !trStdin.ReadStdin {
 		t.Fatalf("expected ReadStdin=true for positional '-' in exec mode")
 	}
+	if trStdin.IncludeUserMCP {
+		t.Fatalf("expected IncludeUserMCP=false by default in exec mode for fast startup")
+	}
+}
+
+func TestTransformArgsImageBeforePromptAndCleanMode(t *testing.T) {
+	tr := TransformArgs([]string{"exec", "--clean", "--with-mcp", "--min-balance", "0.50", "-i", "C:/Temp/a.png", "Descreva a imagem"})
+	if !tr.CleanOutput {
+		t.Fatalf("expected CleanOutput=true")
+	}
+	if !tr.IncludeUserMCP {
+		t.Fatalf("expected IncludeUserMCP=true when --with-mcp is passed")
+	}
+	if tr.MinBalanceUSD != 0.50 {
+		t.Fatalf("expected MinBalanceUSD=0.50, got %v", tr.MinBalanceUSD)
+	}
+	foundAttached := false
+	for _, a := range tr.Args {
+		if a == "Descreva a imagem @C:/Temp/a.png" {
+			foundAttached = true
+			break
+		}
+	}
+	if !foundAttached {
+		t.Fatalf("expected image attachment appended even when -i precedes prompt, got %v", tr.Args)
+	}
+}
+
+func TestFilterCleanOutput(t *testing.T) {
+	raw := "YOLO mode is enabled. All tool calls will be automatically approved.\nResultado final limpo.\nrecap: Tarefa concluída. [Saldo DeepSeek: 4.70 USD]\n"
+	got := FilterCleanOutput(raw)
+	if got != "Resultado final limpo." {
+		t.Fatalf("expected clean output 'Resultado final limpo.', got %q", got)
+	}
 }
