@@ -102,3 +102,22 @@ func TestFilterCleanOutput(t *testing.T) {
 		t.Fatalf("expected clean output 'Resultado final limpo.', got %q", got)
 	}
 }
+
+func TestTransformArgsReviewBookAndTimeout(t *testing.T) {
+	tr := TransformArgs([]string{"review", "--book", "--timeout", "10m", "-C", "C:/Temp", "internal/bridge/bridge.go"})
+	if tr.Mode != "review" {
+		t.Fatalf("expected mode review, got %s", tr.Mode)
+	}
+	if tr.SelectedModel != "deepseek-v4-pro" {
+		t.Fatalf("expected review mode to default to deepseek-v4-pro, got %s", tr.SelectedModel)
+	}
+	if !tr.EditorialMode {
+		t.Fatalf("expected EditorialMode=true when --book is passed")
+	}
+	if tr.Timeout.Minutes() != 10 {
+		t.Fatalf("expected Timeout=10m, got %v", tr.Timeout)
+	}
+	if !slices.Contains(tr.Args, "--approval-mode") || !slices.Contains(tr.Args, "plan") {
+		t.Fatalf("expected review mode to enforce --approval-mode plan, got %v", tr.Args)
+	}
+}

@@ -10,6 +10,7 @@ package runner
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -41,6 +42,9 @@ type UsageLogRecord struct {
 	PromptTokens     uint64  `json:"prompt_tokens,omitempty"`
 	CompletionTokens uint64  `json:"completion_tokens,omitempty"`
 	TotalTokens      uint64  `json:"total_tokens,omitempty"`
+	CacheHitTokens   uint64  `json:"cache_hit_tokens,omitempty"`
+	CacheMissTokens  uint64  `json:"cache_miss_tokens,omitempty"`
+	EstimatedCostUSD float64 `json:"estimated_cost_usd,omitempty"`
 	PromptBrief      string  `json:"prompt_brief,omitempty"`
 }
 
@@ -55,7 +59,9 @@ type TransformResult struct {
 	ExtraAttachments  []string
 	IncludeUserMCP    bool
 	CleanOutput       bool
+	EditorialMode     bool
 	MinBalanceUSD     float64
+	Timeout           time.Duration
 }
 
 // knownSubcommands lists Gemini CLI subcommands where `-m` should not be prepended.
@@ -82,6 +88,8 @@ func TransformArgs(rawArgs []string) TransformResult {
 	promptBrief := ""
 
 	isExecCompat := false
+	isReviewCompat := false
+	explicitModelSet := false
 	sandboxMode := ""
 	hasYoloOrApproval := false
 	hasPromptFlag := false
@@ -90,7 +98,9 @@ func TransformArgs(rawArgs []string) TransformResult {
 	explicitWithMCP := os.Getenv("GEMINISEEK_KEEP_USER_MCP") == "1"
 	explicitNoMCP := os.Getenv("GEMINISEEK_IGNORE_USER_MCP") == "1"
 	cleanOutput := false
+	editorialMode := os.Getenv("GEMINISEEK_BOOK_MODE") == "1"
 	minBalanceUSD := 0.0
+	var timeoutDur time.Duration
 	var extraAttachments []string
 
 	for i := 0; i < len(rawArgs); i++ {
@@ -103,29 +113,55 @@ func TransformArgs(rawArgs []string) TransformResult {
 		switch {
 		case arg == "--pro":
 			selectedModel = config.ProModel
+			explicitModelSet = true
 			continue
 		case arg == "--flash":
 			selectedModel = config.DefaultModel
+			explicitModelSet = true
 			continue
 		case arg == "-m" || arg == "--model":
 			if i+1 < len(rawArgs) {
 				selectedModel = config.ResolveModelAlias(rawArgs[i+1])
+				explicitModelSet = true
 				i++
 				continue
 			}
 		case strings.HasPrefix(arg, "--model="):
 			val := strings.TrimPrefix(arg, "--model=")
 			selectedModel = config.ResolveModelAlias(val)
+			explicitModelSet = true
 			continue
 		case strings.HasPrefix(arg, "-m="):
 			val := strings.TrimPrefix(arg, "-m=")
 			selectedModel = config.ResolveModelAlias(val)
+			explicitModelSet = true
 			continue
 
-		// CodexSeek H2H compatibility flags (`exec`, `--skip-git-repo-check`, `-C`, `-s`, `-a`, `-i`, `--with-mcp`, `--clean`)
+		// CodexSeek H2H compatibility flags (`exec`, `review`, `--skip-git-repo-check`, `-C`, `-s`, `-a`, `-i`, `--with-mcp`, `--clean`, `--book`, `--timeout`)
 		case (arg == "exec" || arg == "e") && !isExecCompat && !isSubcommand:
 			isExecCompat = true
 			mode = "exec"
+			continue
+		case arg == "review" && !isExecCompat && !isSubcommand:
+			isExecCompat = true
+			isReviewCompat = true
+			mode = "review"
+			if sandboxMode == "" {
+				sandboxMode = "read-only"
+			}
+			if !explicitModelSet {
+				selectedModel = config.ProModel
+			}
+			continue
+		case arg == "--book" || arg == "--editorial":
+			editorialMode = true
+			continue
+		case arg == "--timeout" && i+1 < len(rawArgs):
+			timeoutDur = parseFlexibleDuration(rawArgs[i+1])
+			i++
+			continue
+		case strings.HasPrefix(arg, "--timeout="):
+			timeoutDur = parseFlexibleDuration(strings.TrimPrefix(arg, "--timeout="))
 			continue
 		case arg == "--skip-git-repo-check" || arg == "--ignore-user-config" || arg == "--no-mcp":
 			if arg == "--ignore-user-config" || arg == "--no-mcp" {
@@ -211,13 +247,16 @@ func TransformArgs(rawArgs []string) TransformResult {
 		}
 	}
 
-	// If invoked via `geminiseek exec ... "<tarefa>"`, convert positional task into `-p "<tarefa>"`
+	// If invoked via `geminiseek exec/review ... "<tarefa>"`, convert positional task into `-p "<tarefa>"`
 	if isExecCompat && !hasPromptFlag {
 		for idx := len(cleaned) - 1; idx >= 0; idx-- {
 			candidate := cleaned[idx]
 			if candidate == "-" || !strings.HasPrefix(candidate, "-") {
 				if candidate == "-" {
 					readStdin = true
+				}
+				if isReviewCompat && candidate != "-" {
+					candidate = buildReviewPrompt(candidate)
 				}
 				promptBrief = candidate
 				rebuilt := make([]string, 0, len(cleaned)+1)
@@ -228,6 +267,13 @@ func TransformArgs(rawArgs []string) TransformResult {
 				hasPromptFlag = true
 				break
 			}
+		}
+		// If `geminiseek review` was called with no positional target, generate default review prompt
+		if isReviewCompat && !hasPromptFlag {
+			defPrompt := buildReviewPrompt("")
+			promptBrief = defPrompt
+			cleaned = append(cleaned, "-p", defPrompt)
+			hasPromptFlag = true
 		}
 	}
 
@@ -248,9 +294,9 @@ func TransformArgs(rawArgs []string) TransformResult {
 	}
 
 	// Just like CodexSeek's `--ignore-user-config` in `exec` mode, skip user MCP servers by default
-	// in headless/exec calls for ~10x faster startup, unless `--with-mcp` is passed.
+	// in headless/exec/review calls for ~10x faster startup, unless `--with-mcp` is passed.
 	includeUserMCP := true
-	if mode == "exec" || mode == "headless" {
+	if mode == "exec" || mode == "headless" || mode == "review" {
 		includeUserMCP = explicitWithMCP
 	}
 	if explicitNoMCP {
@@ -284,8 +330,32 @@ func TransformArgs(rawArgs []string) TransformResult {
 		ExtraAttachments: extraAttachments,
 		IncludeUserMCP:   includeUserMCP,
 		CleanOutput:      cleanOutput,
+		EditorialMode:    editorialMode,
 		MinBalanceUSD:    minBalanceUSD,
+		Timeout:          timeoutDur,
 	}
+}
+
+func parseFlexibleDuration(raw string) time.Duration {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return 0
+	}
+	if d, err := time.ParseDuration(raw); err == nil {
+		return d
+	}
+	if secs, err := strconv.Atoi(raw); err == nil && secs > 0 {
+		return time.Duration(secs) * time.Second
+	}
+	return 0
+}
+
+func buildReviewPrompt(target string) string {
+	base := "Realize uma revisão técnica rigorosa em modo somente leitura (código, segurança, regressões, concorrência, tratamento de erros e aderência às regras do projeto). Classifique os achados por severidade: [CRÍTICO], [ALTO], [MÉDIO] e [SUGESTÃO], indicando arquivo e linha exata."
+	if strings.TrimSpace(target) == "" {
+		return base + " Inspecione as alterações recentes do repositório (git status / git diff) e os arquivos principais do diretório atual."
+	}
+	return base + " Foco específico solicitado: " + target
 }
 
 // Run executes the upstream Gemini CLI bundle connected to the in-memory DeepSeek bridge.
@@ -368,12 +438,24 @@ func Run(rawArgs []string) (int, error) {
 	if err != nil {
 		return 1, err
 	}
+	bridgeSrv.SetEditorialMode(tr.EditorialMode)
 	defer bridgeSrv.Close()
 
 	nodeArgs := []string{"--no-warnings", bundlePath}
 	nodeArgs = append(nodeArgs, tr.Args...)
 
-	cmd := exec.Command(nodeBin, nodeArgs...)
+	var cmd *exec.Cmd
+	var cancelTimeout context.CancelFunc
+	if tr.Timeout > 0 {
+		ctx, cancel := context.WithTimeout(context.Background(), tr.Timeout)
+		cancelTimeout = cancel
+		cmd = exec.CommandContext(ctx, nodeBin, nodeArgs...)
+	} else {
+		cmd = exec.Command(nodeBin, nodeArgs...)
+	}
+	if cancelTimeout != nil {
+		defer cancelTimeout()
+	}
 	cmd.Stdin = os.Stdin
 	var cleanStdoutBuf, cleanStderrBuf bytes.Buffer
 	if tr.CleanOutput {
@@ -475,7 +557,10 @@ func Run(rawArgs []string) (int, error) {
 
 	exitCode := 0
 	if err != nil {
-		if exitErr, ok := err.(*exec.ExitError); ok {
+		if tr.Timeout > 0 && duration >= tr.Timeout.Seconds() {
+			exitCode = 124
+			err = fmt.Errorf("execução interrompida pelo timeout de segurança (%v)", tr.Timeout)
+		} else if exitErr, ok := err.(*exec.ExitError); ok {
 			exitCode = exitErr.ExitCode()
 			err = nil
 		} else {
@@ -490,6 +575,7 @@ func Run(rawArgs []string) (int, error) {
 }
 
 func recordUsageLog(stateDir, mode, model, workDir, brief string, durationSec float64, exitCode int, stats bridge.BridgeStats) {
+	estCost := bridge.EstimateCostUSD(model, stats.PromptTokens, stats.CompletionTokens, stats.CacheHitTokens, stats.CacheMissTokens)
 	rec := UsageLogRecord{
 		Timestamp:        time.Now().Format(time.RFC3339),
 		Mode:             mode,
@@ -501,6 +587,9 @@ func recordUsageLog(stateDir, mode, model, workDir, brief string, durationSec fl
 		PromptTokens:     stats.PromptTokens,
 		CompletionTokens: stats.CompletionTokens,
 		TotalTokens:      stats.TotalTokens,
+		CacheHitTokens:   stats.CacheHitTokens,
+		CacheMissTokens:  stats.CacheMissTokens,
+		EstimatedCostUSD: estCost,
 		PromptBrief:      brief,
 	}
 

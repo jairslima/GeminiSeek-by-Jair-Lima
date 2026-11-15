@@ -104,6 +104,12 @@ geminiseek exec -C "C:/Temp" -i "C:/Temp/captura.png" "Descreva a imagem"
 
 # Saída limpa (--clean) sem banners YOLO nem linha recap:, ideal para captura direta em scripts H2H
 geminiseek exec --clean --min-balance 0.50 -C "C:/Temp" "Retorne apenas a versão do Go instalada"
+
+# Modo Editorial (--book) para livros/manuscritos (voz do autor, zero travessão, UTF-8 com BOM) + Timeout
+geminiseek --pro --book --timeout 15m exec -C "C:/caminho/livro" "Escreva o capítulo 3 seguindo o plano"
+
+# Subcomando de Revisão Técnica em Modo Somente Leitura (usa DeepSeek V4 Pro automaticamente)
+geminiseek review -C "C:/caminho/do/projeto" "Verifique concorrência e tratamento de erros"
 ```
 
 ### Atualização Automática com o Gemini CLI Upstream (`update` / `sync-upstream`)

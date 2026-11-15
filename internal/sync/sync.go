@@ -405,13 +405,19 @@ func RunStats(jsonOut bool) int {
 		PromptTokens     uint64  `json:"prompt_tokens"`
 		CompletionTokens uint64  `json:"completion_tokens"`
 		TotalTokens      uint64  `json:"total_tokens"`
+		CacheHitTokens   uint64  `json:"cache_hit_tokens"`
+		CacheMissTokens  uint64  `json:"cache_miss_tokens"`
+		EstimatedCostUSD float64 `json:"estimated_cost_usd"`
 	}
 
 	byModel := make(map[string]*modelAgg)
 	totalRuns := 0
 	var totalDuration float64
 	var totalTokens uint64
+	var totalPromptTokens uint64
+	var totalCacheHits uint64
 	var totalReqs uint64
+	var totalCostUSD float64
 
 	for _, l := range lines {
 		var rec struct {
@@ -422,6 +428,9 @@ func RunStats(jsonOut bool) int {
 			PromptTokens     uint64  `json:"prompt_tokens"`
 			CompletionTokens uint64  `json:"completion_tokens"`
 			TotalTokens      uint64  `json:"total_tokens"`
+			CacheHitTokens   uint64  `json:"cache_hit_tokens"`
+			CacheMissTokens  uint64  `json:"cache_miss_tokens"`
+			EstimatedCostUSD float64 `json:"estimated_cost_usd"`
 		}
 		if json.Unmarshal([]byte(l), &rec) == nil {
 			m := rec.Model
@@ -442,12 +451,27 @@ func RunStats(jsonOut bool) int {
 			agg.PromptTokens += rec.PromptTokens
 			agg.CompletionTokens += rec.CompletionTokens
 			agg.TotalTokens += rec.TotalTokens
+			agg.CacheHitTokens += rec.CacheHitTokens
+			agg.CacheMissTokens += rec.CacheMissTokens
+			cost := rec.EstimatedCostUSD
+			if cost == 0 && rec.TotalTokens > 0 {
+				cost = bridge.EstimateCostUSD(m, rec.PromptTokens, rec.CompletionTokens, rec.CacheHitTokens, rec.CacheMissTokens)
+			}
+			agg.EstimatedCostUSD += cost
 
 			totalRuns++
 			totalDuration += rec.DurationSec
 			totalTokens += rec.TotalTokens
+			totalPromptTokens += rec.PromptTokens
+			totalCacheHits += rec.CacheHitTokens
 			totalReqs += rec.APIRequests
+			totalCostUSD += cost
 		}
+	}
+
+	cacheHitPct := 0.0
+	if totalPromptTokens > 0 {
+		cacheHitPct = (float64(totalCacheHits) / float64(totalPromptTokens)) * 100.0
 	}
 
 	balText := "indisponível"
@@ -459,24 +483,28 @@ func RunStats(jsonOut bool) int {
 
 	if jsonOut {
 		payload := map[string]any{
-			"app":              config.AppName,
-			"total_runs":       totalRuns,
-			"total_duration_s": float64(int(totalDuration*100)) / 100,
-			"total_requests":   totalReqs,
-			"total_tokens":     totalTokens,
-			"by_model":         byModel,
-			"deepseek_balance": balText,
+			"app":                 config.AppName,
+			"total_runs":          totalRuns,
+			"total_duration_s":    float64(int(totalDuration*100)) / 100,
+			"total_requests":      totalReqs,
+			"total_tokens":        totalTokens,
+			"total_cache_hits":    totalCacheHits,
+			"cache_hit_rate_pct":  float64(int(cacheHitPct*10)) / 10,
+			"estimated_cost_usd":  float64(int(totalCostUSD*1000000)) / 1000000,
+			"by_model":            byModel,
+			"deepseek_balance":    balText,
 		}
 		b, _ := json.MarshalIndent(payload, "", "  ")
 		fmt.Println(string(b))
 		return 0
 	}
 
-	fmt.Printf("=== %s v%s — Estatísticas de Uso & Consumo de Tokens ===\n\n", config.AppName, config.AppVersion)
+	fmt.Printf("=== %s v%s — Estatísticas de Uso, Context Cache & Custo ===\n\n", config.AppName, config.AppVersion)
 	fmt.Printf("  Total de Execuções   : %d\n", totalRuns)
 	fmt.Printf("  Tempo Acumulado      : %.1fs\n", totalDuration)
 	fmt.Printf("  Requisições API      : %d\n", totalReqs)
-	fmt.Printf("  Tokens Processados   : %d\n", totalTokens)
+	fmt.Printf("  Tokens Processados   : %d (Context Cache Hit: %d tokens / %.1f%%)\n", totalTokens, totalCacheHits, cacheHitPct)
+	fmt.Printf("  Custo Estimado Total : $%.5f USD\n", totalCostUSD)
 	fmt.Printf("  Saldo Atual DeepSeek : %s\n\n", balText)
 
 	if len(byModel) > 0 {
@@ -488,8 +516,8 @@ func RunStats(jsonOut bool) int {
 		sort.Strings(models)
 		for _, m := range models {
 			agg := byModel[m]
-			fmt.Printf("    • %-18s : %d execuções (%d ok) | %.1fs | %d reqs | %d tokens (prompt: %d, saída: %d)\n",
-				m, agg.Runs, agg.SuccessRuns, agg.DurationSec, agg.APIRequests, agg.TotalTokens, agg.PromptTokens, agg.CompletionTokens)
+			fmt.Printf("    • %-18s : %d execs (%d ok) | %.1fs | %d reqs | %d tokens (cache hit: %d, saída: %d) | ~$%.5f USD\n",
+				m, agg.Runs, agg.SuccessRuns, agg.DurationSec, agg.APIRequests, agg.TotalTokens, agg.CacheHitTokens, agg.CompletionTokens, agg.EstimatedCostUSD)
 		}
 	}
 	return 0

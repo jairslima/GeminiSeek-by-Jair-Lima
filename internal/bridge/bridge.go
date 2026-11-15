@@ -36,19 +36,26 @@ type Server struct {
 	apiKey           string
 	upstreamBase     string
 	defaultModel     string
+	editorialMode    bool
 	callSeq          uint64
 	requestsTotal    uint64
 	promptTokens     uint64
 	completionTokens uint64
 	totalTokens      uint64
+	cacheHitTokens   uint64
+	cacheMissTokens  uint64
+	retriesTotal     uint64
 }
 
-// BridgeStats summarizes the requests and token consumption processed by the bridge during a session.
+// BridgeStats summarizes the requests, token consumption, cache hits, and retries processed by the bridge.
 type BridgeStats struct {
 	Requests         uint64 `json:"requests"`
 	PromptTokens     uint64 `json:"prompt_tokens"`
 	CompletionTokens uint64 `json:"completion_tokens"`
 	TotalTokens      uint64 `json:"total_tokens"`
+	CacheHitTokens   uint64 `json:"cache_hit_tokens"`
+	CacheMissTokens  uint64 `json:"cache_miss_tokens"`
+	Retries          uint64 `json:"retries"`
 }
 
 // Stats returns the live metrics of the in-memory bridge session.
@@ -58,7 +65,38 @@ func (s *Server) Stats() BridgeStats {
 		PromptTokens:     atomic.LoadUint64(&s.promptTokens),
 		CompletionTokens: atomic.LoadUint64(&s.completionTokens),
 		TotalTokens:      atomic.LoadUint64(&s.totalTokens),
+		CacheHitTokens:   atomic.LoadUint64(&s.cacheHitTokens),
+		CacheMissTokens:  atomic.LoadUint64(&s.cacheMissTokens),
+		Retries:          atomic.LoadUint64(&s.retriesTotal),
 	}
+}
+
+// SetEditorialMode enables or disables the strict book/manuscript editorial contract on the bridge.
+func (s *Server) SetEditorialMode(enabled bool) {
+	s.editorialMode = enabled
+}
+
+// EstimateCostUSD calculates the estimated USD cost of a session based on DeepSeek API pricing
+// (including automatic disk context cache hit discount).
+func EstimateCostUSD(model string, promptTokens, completionTokens, cacheHitTokens, cacheMissTokens uint64) float64 {
+	if cacheHitTokens == 0 && cacheMissTokens == 0 && promptTokens > 0 {
+		cacheMissTokens = promptTokens
+	}
+	// Official DeepSeek API pricing per 1M tokens (USD):
+	// Standard / Flash / Chat: Cache Hit $0.028/1M, Cache Miss $0.28/1M, Output $0.42/1M
+	// Pro / Reasoner:          Cache Hit $0.14/1M,  Cache Miss $0.55/1M, Output $2.19/1M
+	hitRate := 0.028
+	missRate := 0.28
+	outRate := 0.42
+	if strings.Contains(strings.ToLower(model), "pro") || strings.Contains(strings.ToLower(model), "reasoner") {
+		hitRate = 0.14
+		missRate = 0.55
+		outRate = 2.19
+	}
+	cost := (float64(cacheHitTokens)/1_000_000.0)*hitRate +
+		(float64(cacheMissTokens)/1_000_000.0)*missRate +
+		(float64(completionTokens)/1_000_000.0)*outRate
+	return float64(int(cost*1000000)) / 1000000
 }
 
 // Start launches the in-memory bridge on a random loopback port (`127.0.0.1:0`)
@@ -387,22 +425,53 @@ func (s *Server) handleGenerateContent(w http.ResponseWriter, r *http.Request, m
 	}
 
 	targetURL := s.upstreamBase + "/chat/completions"
-	upReq, err := http.NewRequestWithContext(r.Context(), http.MethodPost, targetURL, bytes.NewReader(dsBytes))
-	if err != nil {
-		writeGeminiError(w, http.StatusInternalServerError, err.Error())
-		return
-	}
-	upReq.Header.Set("Content-Type", "application/json")
-	upReq.Header.Set("Authorization", "Bearer "+s.apiKey)
-	if stream {
-		upReq.Header.Set("Accept", "text/event-stream")
-	}
-
 	client := &http.Client{Timeout: 10 * time.Minute}
-	upResp, err := client.Do(upReq)
-	if err != nil {
-		writeGeminiError(w, http.StatusBadGateway, fmt.Sprintf("erro de comunicação com a API DeepSeek: %v", err))
-		return
+
+	var upResp *http.Response
+	var lastErr error
+	maxAttempts := 4 // 1 initial + up to 3 automatic backoff retries on 429/500/502/503/504 or network reset
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		if attempt > 1 {
+			atomic.AddUint64(&s.retriesTotal, 1)
+			backoff := time.Duration(1<<(attempt-2)) * time.Second
+			select {
+			case <-r.Context().Done():
+				writeGeminiError(w, http.StatusRequestTimeout, "request cancelled during retry backoff")
+				return
+			case <-time.After(backoff):
+			}
+		}
+
+		upReq, reqErr := http.NewRequestWithContext(r.Context(), http.MethodPost, targetURL, bytes.NewReader(dsBytes))
+		if reqErr != nil {
+			writeGeminiError(w, http.StatusInternalServerError, reqErr.Error())
+			return
+		}
+		upReq.Header.Set("Content-Type", "application/json")
+		upReq.Header.Set("Authorization", "Bearer "+s.apiKey)
+		if stream {
+			upReq.Header.Set("Accept", "text/event-stream")
+		}
+
+		upResp, lastErr = client.Do(upReq)
+		if lastErr != nil {
+			if attempt < maxAttempts {
+				continue
+			}
+			writeGeminiError(w, http.StatusBadGateway, fmt.Sprintf("erro de comunicação com a API DeepSeek após %d tentativas: %v", attempt, lastErr))
+			return
+		}
+
+		if upResp.StatusCode == http.StatusTooManyRequests || upResp.StatusCode == http.StatusInternalServerError ||
+			upResp.StatusCode == http.StatusBadGateway || upResp.StatusCode == http.StatusServiceUnavailable ||
+			upResp.StatusCode == http.StatusGatewayTimeout {
+			if attempt < maxAttempts {
+				_, _ = io.Copy(io.Discard, upResp.Body)
+				_ = upResp.Body.Close()
+				continue
+			}
+		}
+		break
 	}
 	defer upResp.Body.Close()
 
@@ -443,11 +512,19 @@ func (s *Server) translateGeminiToDeepSeek(gReq *geminiRequest, model string, st
 				"You are Gemini CLI, an autonomous CLI agent specializing in software engineering tasks.",
 				fmt.Sprintf("You are GeminiSeek (by Jair Lima), an autonomous CLI software engineering agent powered by DeepSeek (%s) on the Gemini CLI harness.", model),
 			)
+			if s.editorialMode {
+				sysText += "\n\n" + editorialModeContract
+			}
 			messages = append(messages, dsMessage{
 				Role:    "system",
 				Content: sysText,
 			})
 		}
+	} else if s.editorialMode {
+		messages = append(messages, dsMessage{
+			Role:    "system",
+			Content: editorialModeContract,
+		})
 	}
 
 	// Track synthetic tool call IDs so FunctionCall and FunctionResponse match 1:1
@@ -791,11 +868,19 @@ type dsChatResponse struct {
 		FinishReason string    `json:"finish_reason"`
 	} `json:"choices"`
 	Usage *struct {
-		PromptTokens     int `json:"prompt_tokens"`
-		CompletionTokens int `json:"completion_tokens"`
-		TotalTokens      int `json:"total_tokens"`
+		PromptTokens          int `json:"prompt_tokens"`
+		CompletionTokens      int `json:"completion_tokens"`
+		TotalTokens           int `json:"total_tokens"`
+		PromptCacheHitTokens  int `json:"prompt_cache_hit_tokens"`
+		PromptCacheMissTokens int `json:"prompt_cache_miss_tokens"`
 	} `json:"usage,omitempty"`
 }
+
+const editorialModeContract = `## CONTRATO EDITORIAL OBRIGATÓRIO (MODO LIVRO / MANUSCRITO)
+1. VOZ DO AUTOR: Nunca escreva o nome "Jair Lima" nem a expressão "o autor" no corpo do texto do capítulo ou livro. Escreva diretamente com a voz autoral da obra.
+2. PROIBIÇÃO DE TRAVESSÃO: É terminantemente proibido usar travessão (— ou -) como pontuação para isolar orações ou explicações. Use vírgula, ponto ou dois-pontos no lugar.
+3. IDIOMA E RIGOR: Redija em português do Brasil culto, fluido, com acentuação impecável e sem marcas artificiais.
+4. PERSISTÊNCIA EM DISCO: Ao gravar ou atualizar arquivos de manuscrito (.md ou .txt) via scripts ou ferramentas, preserve a codificação UTF-8 (preferencialmente UTF-8 com BOM / utf-8-sig no Windows) e verifique fisicamente o arquivo salvo.`
 
 func (s *Server) unaryDeepSeekToGeminiJSON(w http.ResponseWriter, body io.Reader, requestedModel string) {
 	raw, err := io.ReadAll(body)
@@ -869,10 +954,13 @@ func (s *Server) unaryDeepSeekToGeminiJSON(w http.ResponseWriter, body io.Reader
 		atomic.AddUint64(&s.promptTokens, uint64(dsResp.Usage.PromptTokens))
 		atomic.AddUint64(&s.completionTokens, uint64(dsResp.Usage.CompletionTokens))
 		atomic.AddUint64(&s.totalTokens, uint64(dsResp.Usage.TotalTokens))
+		atomic.AddUint64(&s.cacheHitTokens, uint64(dsResp.Usage.PromptCacheHitTokens))
+		atomic.AddUint64(&s.cacheMissTokens, uint64(dsResp.Usage.PromptCacheMissTokens))
 		gResp["usageMetadata"] = map[string]any{
-			"promptTokenCount":     dsResp.Usage.PromptTokens,
-			"candidatesTokenCount": dsResp.Usage.CompletionTokens,
-			"totalTokenCount":      dsResp.Usage.TotalTokens,
+			"promptTokenCount":        dsResp.Usage.PromptTokens,
+			"candidatesTokenCount":    dsResp.Usage.CompletionTokens,
+			"totalTokenCount":         dsResp.Usage.TotalTokens,
+			"cachedContentTokenCount": dsResp.Usage.PromptCacheHitTokens,
 		}
 	}
 
@@ -978,6 +1066,12 @@ func (s *Server) streamDeepSeekToGeminiSSE(w http.ResponseWriter, body io.Reader
 			if tt, ok := lastUsage["totalTokenCount"].(int); ok {
 				atomic.AddUint64(&s.totalTokens, uint64(tt))
 			}
+			if ch, ok := lastUsage["cachedContentTokenCount"].(int); ok {
+				atomic.AddUint64(&s.cacheHitTokens, uint64(ch))
+			}
+			if cm, ok := lastUsage["cacheMissTokenCount"].(int); ok {
+				atomic.AddUint64(&s.cacheMissTokens, uint64(cm))
+			}
 			chunk["usageMetadata"] = lastUsage
 		}
 		emitChunk(chunk)
@@ -1005,9 +1099,11 @@ func (s *Server) streamDeepSeekToGeminiSSE(w http.ResponseWriter, body io.Reader
 		}
 		if dsChunk.Usage != nil {
 			lastUsage = map[string]any{
-				"promptTokenCount":     dsChunk.Usage.PromptTokens,
-				"candidatesTokenCount": dsChunk.Usage.CompletionTokens,
-				"totalTokenCount":      dsChunk.Usage.TotalTokens,
+				"promptTokenCount":        dsChunk.Usage.PromptTokens,
+				"candidatesTokenCount":    dsChunk.Usage.CompletionTokens,
+				"totalTokenCount":         dsChunk.Usage.TotalTokens,
+				"cachedContentTokenCount": dsChunk.Usage.PromptCacheHitTokens,
+				"cacheMissTokenCount":     dsChunk.Usage.PromptCacheMissTokens,
 			}
 		}
 

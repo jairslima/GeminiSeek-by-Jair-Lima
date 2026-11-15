@@ -142,6 +142,9 @@ Atalhos exclusivos do GeminiSeek:
   -m <flash|pro|chat|r1>     Seleciona o modelo DeepSeek por alias curto ou slug oficial
   geminiseek -p "tarefa" -y  Executa tarefa em modo headless autônomo (estilo Gemini CLI)
   geminiseek exec -C <dir>   Executa tarefa em modo headless (compatível com sintaxe CodexSeek)
+  geminiseek review [alvo]   Executa revisão técnica rigorosa em modo somente leitura com DeepSeek V4 Pro
+  --book / --editorial       Ativa contrato editorial para livros (voz do autor, zero travessão, UTF-8 BOM)
+  --timeout <dur>            Define timeout automático de segurança (ex: --timeout 10m ou --timeout 300s)
   --clean / --with-mcp       Saída limpa sem banners/recap (--clean) ou carga de MCPs no modo exec (--with-mcp)
   geminiseek guard [min_usd] Guarda nativa de saldo DeepSeek (ex: geminiseek guard 0.50 -> JSON GO/SALDO_BAIXO)
   geminiseek balance|saldo   Exibe o saldo atual da conta DeepSeek API em USD

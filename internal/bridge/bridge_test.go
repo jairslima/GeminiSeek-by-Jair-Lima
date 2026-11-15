@@ -115,3 +115,60 @@ func TestBridgeStreamAndToolCallingRoundTrip(t *testing.T) {
 		t.Errorf("expected functionCall part in SSE output, got:\n%s", outStr)
 	}
 }
+
+func TestBridgeRetryAndEditorialMode(t *testing.T) {
+	calls := 0
+	var capturedSystem string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		raw, _ := io.ReadAll(r.Body)
+		var req map[string]any
+		_ = json.Unmarshal(raw, &req)
+		if msgs, ok := req["messages"].([]any); ok && len(msgs) > 0 {
+			if m0, ok := msgs[0].(map[string]any); ok && m0["role"] == "system" {
+				capturedSystem, _ = m0["content"].(string)
+			}
+		}
+		if calls == 1 {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_, _ = w.Write([]byte(`{"error":"temporary overload"}`))
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"id":"chatcmpl-2","model":"deepseek-v4-pro","choices":[{"index":0,"message":{"role":"assistant","content":"Capítulo revisado."},"finish_reason":"stop"}],"usage":{"prompt_tokens":100,"completion_tokens":50,"total_tokens":150,"prompt_cache_hit_tokens":80,"prompt_cache_miss_tokens":20}}`))
+	}))
+	defer upstream.Close()
+
+	srv, err := Start("test-key", upstream.URL, "deepseek-v4-pro")
+	if err != nil {
+		t.Fatalf("failed to start bridge: %v", err)
+	}
+	srv.SetEditorialMode(true)
+	defer srv.Close()
+
+	reqPayload := map[string]any{
+		"contents": []any{
+			map[string]any{
+				"role":  "user",
+				"parts": []any{map[string]any{"text": "Escreva um parágrafo."}},
+			},
+		},
+	}
+	b, _ := json.Marshal(reqPayload)
+	resp, err := http.Post(srv.BaseURL()+"/v1beta/models/deepseek-v4-pro:generateContent", "application/json", bytes.NewReader(b))
+	if err != nil {
+		t.Fatalf("POST failed: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected HTTP 200 after retry, got %d", resp.StatusCode)
+	}
+	if !strings.Contains(capturedSystem, "CONTRATO EDITORIAL OBRIGATÓRIO") {
+		t.Fatalf("expected editorial mode contract in system message, got: %s", capturedSystem)
+	}
+	st := srv.Stats()
+	if st.Retries != 1 || st.CacheHitTokens != 80 || st.CacheMissTokens != 20 {
+		t.Fatalf("unexpected bridge stats: %+v", st)
+	}
+}
